@@ -18,3 +18,5 @@ cachetools
 tqdm
 aiofiles
 psutil
+telethon
+aiohttp
