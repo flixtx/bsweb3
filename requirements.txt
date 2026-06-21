@@ -20,3 +20,4 @@ aiofiles
 psutil
 telethon
 aiohttp
+cryptography
