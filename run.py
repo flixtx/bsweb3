@@ -1,7 +1,6 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, APIRouter
 import sys
 
-# Tenta importar o mediaflow_proxy
 try:
     from mediaflow_proxy.main import app as mediaflow_app
 except ImportError:
@@ -9,21 +8,56 @@ except ImportError:
     print("Instale usando: pip install mediaflow-proxy")
     sys.exit(1)
 
-# Inicializa a aplicação FastAPI principal
+# Inicializa a aplicação principal
 main_app = FastAPI(
     title="MediaFlow Proxy Wrapper",
     description="Aplicação wrapper para MediaFlow Proxy",
     version="1.0.0"
 )
 
-# Simplesmente inclui todo o router do mediaflow_app
-# Isso lida com todos os tipos de rota automaticamente
-main_app.include_router(mediaflow_app.router)
+# Cria um novo router
+clean_router = APIRouter()
 
-# Adiciona endpoints personalizados
+# Itera sobre as rotas do mediaflow_app
+for route in mediaflow_app.router.routes:
+    try:
+        # Obtém o nome da rota
+        route_name = getattr(route, 'name', '')
+        route_path = getattr(route, 'path', '')
+        
+        # Pula a rota estática problemática
+        if route_name == 'static':
+            print(f"Pulando rota estática: {route_path}")
+            continue
+        
+        # Pula rotas vazias
+        if not route_path and not route_name:
+            print("Pulando rota sem path e sem nome")
+            continue
+        
+        # Adiciona a rota ao router limpo
+        clean_router.routes.append(route)
+        print(f"Rota adicionada: {route_path} ({route_name})")
+        
+    except Exception as e:
+        print(f"Erro ao processar rota: {e}")
+        continue
+
+# Inclui o router limpo na aplicação principal
+main_app.include_router(clean_router)
+
+# Endpoints personalizados
 @main_app.get("/health")
 async def health_check():
     return {"status": "saudável", "serviço": "mediaflow-proxy-wrapper"}
+
+@main_app.get("/")
+async def root():
+    return {
+        "mensagem": "MediaFlow Proxy Wrapper",
+        "rotas": f"{len(main_app.routes)} rotas carregadas",
+        "status": "online"
+    }
 
 @main_app.get("/routes")
 async def list_routes():
@@ -36,12 +70,14 @@ async def list_routes():
                 "methods": getattr(route, 'methods', ['GET']),
                 "name": getattr(route, 'name', 'sem_nome')
             })
-    return {"rotas": routes}
+    return {"total": len(routes), "rotas": routes}
 
 if __name__ == "__main__":
     import uvicorn
-    print("Iniciando MediaFlow Proxy Wrapper...")
-    print(f"Total de rotas carregadas: {len(main_app.routes)}")
+    print(f"\n{'='*50}")
+    print(f"MediaFlow Proxy Wrapper iniciado")
+    print(f"Total de rotas: {len(main_app.routes)}")
+    print(f"{'='*50}\n")
     uvicorn.run(
         main_app, 
         host="0.0.0.0", 
