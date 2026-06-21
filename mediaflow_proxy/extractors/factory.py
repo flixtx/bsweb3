@@ -1,8 +1,8 @@
 from typing import Dict, Type
 
 from mediaflow_proxy.extractors.base import BaseExtractor, ExtractorError
-from mediaflow_proxy.extractors.dlhd import DLHDExtractor
 from mediaflow_proxy.extractors.doodstream import DoodStreamExtractor
+from mediaflow_proxy.extractors.city import CityExtractor
 from mediaflow_proxy.extractors.sportsonline import SportsonlineExtractor
 from mediaflow_proxy.extractors.filelions import FileLionsExtractor
 from mediaflow_proxy.extractors.filemoon import FileMoonExtractor
@@ -24,12 +24,15 @@ from mediaflow_proxy.extractors.vidoza import VidozaExtractor
 from mediaflow_proxy.extractors.vixcloud import VixCloudExtractor
 from mediaflow_proxy.extractors.fastream import FastreamExtractor
 from mediaflow_proxy.extractors.voe import VoeExtractor
+from mediaflow_proxy.extractors.vidfast import VidFastExtractor
+from mediaflow_proxy.extractors.streamhg import StreamHGExtractor
 
 
 class ExtractorFactory:
     """Factory for creating URL extractors."""
 
     _extractors: Dict[str, Type[BaseExtractor]] = {
+        "City": CityExtractor,
         "Doodstream": DoodStreamExtractor,
         "FileLions": FileLionsExtractor,
         "FileMoon": FileMoonExtractor,
@@ -46,13 +49,14 @@ class ExtractorFactory:
         "Maxstream": MaxstreamExtractor,
         "LiveTV": LiveTVExtractor,
         "LuluStream": LuluStreamExtractor,
-        "DLHD": DLHDExtractor,
         "Vavoo": VavooExtractor,
         "Vidmoly": VidmolyExtractor,
         "Vidoza": VidozaExtractor,
         "Fastream": FastreamExtractor,
         "Voe": VoeExtractor,
         "Sportsonline": SportsonlineExtractor,
+        "VidFast": VidFastExtractor,
+        "StreamHG": StreamHGExtractor,
     }
 
     @classmethod

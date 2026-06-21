@@ -3,7 +3,7 @@ import time
 import re
 import uuid
 from typing import Any, Dict, Optional
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 from mediaflow_proxy.extractors.base import BaseExtractor, ExtractorError
 
@@ -13,54 +13,84 @@ logger = logging.getLogger(__name__)
 class VavooExtractor(BaseExtractor):
     """Vavoo URL extractor per risolvere link vavoo.to"""
 
-    API_UA = "electron-fetch/1.0 electron (+https://github.com/arantes555/electron-fetch)"
+    API_UA = "okhttp/4.11.0"
+    RESOLVE_UA = "MediaHubMX/2"
     TS_UA = "VAVOO/2.6"
 
     def __init__(self, request_headers: dict):
         super().__init__(request_headers)
+        # Endpoint is resolved dynamically per-extraction based on the stream URL type.
         self.mediaflow_endpoint = "proxy_stream_endpoint"
 
     async def _get_auth_signature(self) -> Optional[str]:
-        """Get authentication signature via /api/app/ping (electron flow)."""
+        """Get authentication signature via lokke.app/api/app/ping (aligned with working plugin)."""
         unique_id = uuid.uuid4().hex[:16]
+        now_ms = int(time.time() * 1000)
         headers = {
             "user-agent": self.API_UA,
-            "accept": "*/*",
-            "Accept-Language": "de",
-            "Accept-Encoding": "gzip, deflate",
+            "accept": "application/json",
             "content-type": "application/json; charset=utf-8",
-            "Connection": "close",
+            "accept-encoding": "gzip",
         }
         body = {
-            "token": "8Us2TfjeOFrzqFFTEjL3E5KfdAWGa5PV3wQe60uK4BmzlkJRMYFu0ufaM_eeDXKS2U04XUuhbDTgGRJrJARUwzDyCcRToXhW5AcDekfFMfwNUjuieeQ1uzeDB9YWyBL2cn5Al3L3gTnF8Vk1t7rPwkBob0swvxA",
-            "reason": "player.enter",
+            "token": "ldCvE092e7gER0rVIajfsXIvRhwlrAzP6_1oEJ4q6HH89QHt24v6NNL_jQJO219hiLOXF2hqEfsUuEWitEIGN4EaHHEHb7Cd7gojc5SQYRFzU3XWo_kMeryAUbcwWnQrnf0-",
+            "reason": "app-blur",
             "locale": "de",
             "theme": "dark",
             "metadata": {
-                "device": {"type": "Desktop", "brand": "Unknown", "model": "Unknown", "name": "Unknown", "uniqueId": unique_id},
-                "os": {"name": "windows", "version": "10.0.22631", "abis": [], "host": "electron"},
-                "app": {"platform": "electron", "version": "3.1.4", "buildId": "288045000", "engine": "jsc", "signatures": [], "installer": "unknown"},
-                "version": {"package": "tv.vavoo.app", "binary": "3.1.4", "js": "3.1.4"},
+                "device": {
+                    "type": "Handset",
+                    "brand": "google",
+                    "model": "Nexus",
+                    "name": "21081111RG",
+                    "uniqueId": unique_id,
+                },
+                "os": {"name": "android", "version": "7.1.2", "abis": ["arm64-v8a"], "host": "android"},
+                "app": {
+                    "platform": "android",
+                    "version": "1.1.0",
+                    "buildId": "97215000",
+                    "engine": "hbc85",
+                    "signatures": ["6e8a975e3cbf07d5de823a760d4c2547f86c1403105020adee5de67ac510999e"],
+                    "installer": "com.android.vending",
+                },
+                "version": {"package": "app.lokke.main", "binary": "1.1.0", "js": "1.1.0"},
+                "platform": {
+                    "isAndroid": True,
+                    "isIOS": False,
+                    "isTV": False,
+                    "isWeb": False,
+                    "isMobile": True,
+                    "isWebTV": False,
+                    "isElectron": False,
+                },
             },
-            "appFocusTime": 27229,
-            "playerActive": True,
+            "appFocusTime": 0,
+            "playerActive": False,
             "playDuration": 0,
-            "devMode": False,
-            "hasAddon": False,
+            "devMode": True,
+            "hasAddon": True,
             "castConnected": False,
-            "package": "tv.vavoo.app",
-            "version": "3.1.4",
+            "package": "app.lokke.main",
+            "version": "1.1.0",
             "process": "app",
-            "firstAppStart": int(time.time() * 1000) - 86400000,
-            "lastAppStart": int(time.time() * 1000),
-            "ipLocation": "",
+            "firstAppStart": now_ms - 86400000,
+            "lastAppStart": now_ms,
+            "ipLocation": None,
             "adblockEnabled": False,
-            "proxy": {"supported": ["ss"], "engine": "ss", "enabled": False, "autoServer": True, "id": "ca-bhs"},
+            "proxy": {
+                "supported": ["ss", "openvpn"],
+                "engine": "openvpn",
+                "ssVersion": 1,
+                "enabled": False,
+                "autoServer": True,
+                "id": "fi-hel",
+            },
             "iap": {"supported": True},
         }
         try:
             resp = await self._make_request(
-                "https://www.vavoo.tv/api/app/ping",
+                "https://www.lokke.app/api/app/ping",
                 method="POST",
                 json=body,
                 headers=headers,
@@ -70,13 +100,13 @@ class VavooExtractor(BaseExtractor):
             try:
                 result = resp.json()
             except Exception:
-                logger.warning("Vavoo ping returned non-json response (status=%s).", resp.status)
+                logger.warning("Lokke ping returned non-json response (status=%s).", resp.status)
                 return None
             addon_sig = result.get("addonSig") if isinstance(result, dict) else None
             if addon_sig:
-                logger.info("Successfully obtained Vavoo auth signature (electron mode)")
+                logger.info("Successfully obtained auth signature from lokke.app")
                 return addon_sig
-            logger.warning("No addonSig in Vavoo API response: %s", result)
+            logger.warning("No addonSig in lokke API response: %s", result)
             return None
         except Exception as e:
             logger.debug("_get_auth_signature error: %s", e)
@@ -103,17 +133,15 @@ class VavooExtractor(BaseExtractor):
             return None
 
     async def _resolve_with_auth(self, url: str, signature: str) -> Optional[str]:
-        """Resolve a Vavoo link using the MediaHubMX API with electron-mode signature."""
+        """Resolve a Vavoo link using the MediaHubMX API with auth signature."""
         headers = {
-            "user-agent": self.API_UA,
-            "accept": "*/*",
-            "Accept-Language": "de",
-            "Accept-Encoding": "gzip, deflate",
+            "user-agent": self.RESOLVE_UA,
+            "accept": "application/json",
             "content-type": "application/json; charset=utf-8",
-            "Connection": "close",
+            "accept-encoding": "gzip",
             "mediahubmx-signature": signature,
         }
-        payload = {"language": "de", "region": "AT", "url": url, "clientVersion": "3.1.4"}
+        payload = {"language": "de", "region": "AT", "url": url, "clientVersion": "3.0.2"}
         try:
             resp = await self._make_request(
                 "https://vavoo.to/mediahubmx-resolve.json",
@@ -161,7 +189,9 @@ class VavooExtractor(BaseExtractor):
                 m3u8 = re.findall(r'(https?://[^\s"\'<>]+\.m3u8[^\s"\'<>]*)', text)
                 if m3u8:
                     return m3u8[0]
-                generic = re.findall(r'(https?://[^\s"\'<>]+(?:\.ts|/live/|/stream/|/playlist|/index)[^\s"\'<>]*)', text)
+                generic = re.findall(
+                    r'(https?://[^\s"\'<>]+(?:\.ts|/live/|/stream/|/playlist|/index)[^\s"\'<>]*)', text
+                )
                 if generic:
                     return generic[0]
             return final_url
@@ -178,7 +208,9 @@ class VavooExtractor(BaseExtractor):
         base = re.sub(r"/index\.m3u8(?:\?.*)?$", "", url.replace("vavoo-iptv", "live2")).rstrip("/")
         ts_url = f"{base}.ts?n=1&b=5&vavoo_auth={quote(ts_sig, safe='')}"
         try:
-            resp = await self._make_request(ts_url, method="GET", headers={"User-Agent": self.TS_UA}, timeout=15, retries=1)
+            resp = await self._make_request(
+                ts_url, method="GET", headers={"User-Agent": self.TS_UA}, timeout=15, retries=1
+            )
             if getattr(resp, "status", 400) < 400:
                 return ts_url
         except Exception:
@@ -198,8 +230,7 @@ class VavooExtractor(BaseExtractor):
             )
             status = getattr(resp, "status", 0)
             if status in (301, 302, 303, 307, 308):
-                location = (getattr(resp, "headers", {}).get("Location")
-                            or getattr(resp, "headers", {}).get("location"))
+                location = getattr(resp, "headers", {}).get("Location") or getattr(resp, "headers", {}).get("location")
                 if location:
                     logger.info("Vavoo web-vod redirected to: %s", location)
                     return location
@@ -232,10 +263,14 @@ class VavooExtractor(BaseExtractor):
                 "user-agent": self.API_UA,
                 "referer": "https://vavoo.to/",
             }
+            wv_path = urlparse(resolved_url).path.lower()
+            wv_endpoint = (
+                "hls_manifest_proxy" if wv_path.endswith((".m3u8", ".m3u", ".m3u_plus")) else self.mediaflow_endpoint
+            )
             return {
                 "destination_url": resolved_url,
                 "request_headers": stream_headers,
-                "mediaflow_endpoint": self.mediaflow_endpoint,
+                "mediaflow_endpoint": wv_endpoint,
             }
 
         resolved_url = None
@@ -249,10 +284,9 @@ class VavooExtractor(BaseExtractor):
                 candidate = await self._follow_stream_url(candidate)
                 resolved_url = candidate
                 stream_headers = {
-                    "user-agent": self.API_UA,
+                    "user-agent": self.RESOLVE_UA,
                     "referer": "https://vavoo.to/",
                     "origin": "https://vavoo.to",
-                    "mediahubmx-signature": sig,
                 }
                 logger.info("Using Auth Resolve Mode: %s", resolved_url)
 
@@ -273,8 +307,16 @@ class VavooExtractor(BaseExtractor):
             }
             logger.info("Using Direct Fallback Mode: %s", resolved_url)
 
+        # Use HLS manifest proxy when the resolved URL is an M3U8 playlist so
+        # the proxy rewrites relative segment URLs before the player sees them.
+        # TS / raw stream URLs go through the stream proxy as-is.
+        path = urlparse(resolved_url).path.lower()
+        m3u8_endpoint = (
+            "hls_manifest_proxy" if path.endswith((".m3u8", ".m3u", ".m3u_plus")) else self.mediaflow_endpoint
+        )
+
         return {
             "destination_url": resolved_url,
             "request_headers": stream_headers,
-            "mediaflow_endpoint": self.mediaflow_endpoint,
+            "mediaflow_endpoint": m3u8_endpoint,
         }

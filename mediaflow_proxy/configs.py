@@ -75,9 +75,10 @@ class Settings(BaseSettings):
     remux_to_ts: bool = False  # Remux fMP4 segments to MPEG-TS for ExoPlayer/VLC compatibility.
     processed_segment_cache_ttl: int = 60  # TTL (seconds) for caching processed (decrypted/remuxed) segments.
 
-    # FlareSolverr settings (for Cloudflare bypass)
-    flaresolverr_url: str | None = None  # FlareSolverr service URL. Example: http://localhost:8191
-    flaresolverr_timeout: int = 60  # Timeout (seconds) for FlareSolverr requests.
+    # Byparr settings — Firefox/Camoufox-based solver for Cloudflare bypass and chevy IP whitelist.
+    # https://github.com/ThePhaseless/Byparr  (drop-in FlareSolverr-compatible API)
+    byparr_url: str | None = None  # Byparr service URL. Example: http://localhost:8192
+    byparr_timeout: int = 60  # Timeout (seconds) for Byparr requests.
 
     # Acestream settings
     enable_acestream: bool = False  # Whether to enable Acestream proxy support.
@@ -95,6 +96,8 @@ class Settings(BaseSettings):
     telegram_session_string: SecretStr | None = None  # Persistent session string (avoids re-authentication).
     telegram_max_connections: int = 8  # Max parallel DC connections for downloads (max 20, careful of floods).
     telegram_request_timeout: int = 30  # Request timeout in seconds.
+    telegram_document_scan_limit: int = 500  # Max recent messages to scan when resolving chat_id+document_id.
+    telegram_document_cache_ttl: int = 3600  # TTL (seconds) for cached document_id->message_id mappings.
 
     # Transcode settings
     enable_transcode: bool = True  # Whether to enable on-the-fly transcoding endpoints (MKV→fMP4, HLS VOD).
@@ -110,6 +113,25 @@ class Settings(BaseSettings):
     upstream_retry_attempts: int = 2  # Number of retry attempts when upstream disconnects during streaming.
     upstream_retry_delay: float = 1.0  # Delay (seconds) between retry attempts.
     graceful_stream_end: bool = True  # Return valid empty playlist instead of error when upstream fails.
+
+    # Generic HTTP forward endpoint (/proxy/forward) settings
+    forward_allowed_hosts: list[str] = []  # Allowlist of hostnames. Empty = allow all.
+    forward_denied_hosts: list[str] = []  # Extra denied hostnames (in addition to automatic private-IP guard).
+    forward_max_body_bytes: int = (
+        10 * 1024 * 1024
+    )  # Deprecated: use forward_max_request_body_bytes / forward_max_response_body_bytes.
+    forward_max_request_body_bytes: int = (
+        50 * 1024 * 1024
+    )  # Max incoming request body size (50 MB — allows NZB/torrent file uploads).
+    forward_max_response_body_bytes: int = (
+        10 * 1024 * 1024
+    )  # Max upstream response body size (10 MB — API JSON responses).
+    public_ip: str | None = (
+        None  # MediaFlow's own public IP. Used to substitute {mediaflow_ip} in forwarded requests. Auto-detected if not set.
+    )
+
+    # EPG proxy settings
+    epg_cache_ttl: int = 3600  # TTL (seconds) for cached EPG/XMLTV data. Default 1 hour.
 
     # Redis settings
     redis_url: str | None = None  # Redis URL for distributed locking and caching. None = disabled.

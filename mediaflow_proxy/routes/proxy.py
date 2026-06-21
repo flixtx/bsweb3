@@ -1,11 +1,13 @@
 import asyncio
+import ipaddress
 import logging
 import re
 from functools import lru_cache
 from typing import Annotated
-from urllib.parse import quote, unquote
+from urllib.parse import quote, unquote, urlparse
 
 import aiohttp
+from aiohttp import ClientTimeout
 from fastapi import Request, Depends, APIRouter, Query, HTTPException, Response
 from fastapi.datastructures import QueryParams
 
@@ -29,18 +31,15 @@ from mediaflow_proxy.schemas import (
 )
 from mediaflow_proxy.utils.base64_utils import process_potential_base64_url
 from mediaflow_proxy.utils.extractor_helpers import (
-    check_and_extract_dlhd_stream,
     check_and_extract_sportsonline_stream,
 )
 from mediaflow_proxy.utils.hls_prebuffer import hls_prebuffer
-from mediaflow_proxy.utils.hls_utils import parse_hls_playlist, find_stream_by_resolution
+from mediaflow_proxy.utils.http_client import create_aiohttp_session
 from mediaflow_proxy.utils.http_utils import (
     get_proxy_headers,
     ProxyRequestHeaders,
     apply_header_manipulation,
 )
-from mediaflow_proxy.utils.http_client import create_aiohttp_session
-from mediaflow_proxy.utils.m3u8_processor import M3U8Processor
 from mediaflow_proxy.utils.stream_transformers import apply_transformer_to_bytes
 
 
@@ -181,52 +180,6 @@ async def hls_manifest_proxy(
     # Sanitize destination URL to fix common encoding issues
     hls_params.destination = sanitize_url(hls_params.destination)
 
-    # Check if this is a retry after 403 error (dlhd_retry parameter)
-    force_refresh = request.query_params.get("dlhd_retry") == "1"
-
-    # Check if destination contains DLHD pattern and extract stream directly
-    dlhd_result = await check_and_extract_dlhd_stream(
-        request, hls_params.destination, proxy_headers, force_refresh=force_refresh
-    )
-    dlhd_original_url = None
-    if dlhd_result:
-        # Store original DLHD URL for cache invalidation on 403 errors
-        dlhd_original_url = hls_params.destination
-
-        # Update destination and headers with extracted stream data
-        hls_params.destination = dlhd_result["destination_url"]
-        extracted_headers = dlhd_result.get("request_headers", {})
-        proxy_headers.request.update(extracted_headers)
-
-        # Check if extractor wants key-only proxy (DLHD uses hls_key_proxy endpoint)
-        if dlhd_result.get("mediaflow_endpoint") == "hls_key_proxy":
-            hls_params.key_only_proxy = True
-
-        # Check if extractor wants to force playlist proxy (needed for .css disguised m3u8)
-        if dlhd_result.get("force_playlist_proxy"):
-            hls_params.force_playlist_proxy = True
-
-        # Also add headers to query params so they propagate to key/segment requests
-        # This is necessary because M3U8Processor encodes headers as h_* query params
-        query_dict = dict(request.query_params)
-        for header_name, header_value in extracted_headers.items():
-            # Add header with h_ prefix to query params
-            query_dict[f"h_{header_name}"] = header_value
-        # Add DLHD original URL to track for cache invalidation
-        if dlhd_original_url:
-            query_dict["dlhd_original"] = dlhd_original_url
-        # Add DLHD key params if present (for dynamic key header computation)
-        if dlhd_result.get("dlhd_channel_salt"):
-            query_dict["dlhd_salt"] = dlhd_result["dlhd_channel_salt"]
-        if dlhd_result.get("dlhd_auth_token"):
-            query_dict["dlhd_token"] = dlhd_result["dlhd_auth_token"]
-        if dlhd_result.get("dlhd_iframe_url"):
-            query_dict["dlhd_iframe"] = dlhd_result["dlhd_iframe_url"]
-        # Remove retry flag from subsequent requests
-        query_dict.pop("dlhd_retry", None)
-        # Update request query params
-        request._query_params = QueryParams(query_dict)
-
     # Check if destination contains Sportsonline pattern and extract stream directly
     sportsonline_result = await check_and_extract_sportsonline_stream(request, hls_params.destination, proxy_headers)
     if sportsonline_result:
@@ -244,123 +197,8 @@ async def hls_manifest_proxy(
         for header_name, header_value in extracted_headers.items():
             # Add header with h_ prefix to query params
             query_dict[f"h_{header_name}"] = header_value
-        # Remove retry flag from subsequent requests
-        query_dict.pop("dlhd_retry", None)
         # Update request query params
         request._query_params = QueryParams(query_dict)
-
-    # Wrap the handler to catch 403 errors and retry with cache invalidation
-    try:
-        result = await _handle_hls_with_dlhd_retry(request, hls_params, proxy_headers, dlhd_original_url)
-        return result
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.exception(f"Unexpected error in hls_manifest_proxy: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-async def _handle_hls_with_dlhd_retry(
-    request: Request, hls_params: HLSManifestParams, proxy_headers: ProxyRequestHeaders, dlhd_original_url: str | None
-):
-    """
-    Handle HLS request with automatic retry on 403 errors for DLHD streams.
-    """
-    # Check if resolution selection is needed (either max_res or specific resolution)
-    if hls_params.max_res or hls_params.resolution:
-        async with create_aiohttp_session(hls_params.destination) as (session, proxy_url):
-            try:
-                response = await session.get(
-                    hls_params.destination,
-                    headers=proxy_headers.request,
-                    proxy=proxy_url,
-                )
-                response.raise_for_status()
-                playlist_content = await response.text()
-            except aiohttp.ClientResponseError as e:
-                raise HTTPException(
-                    status_code=502,
-                    detail=f"Failed to fetch HLS manifest from origin: {e.status}",
-                ) from e
-            except asyncio.TimeoutError as e:
-                raise HTTPException(
-                    status_code=504,
-                    detail=f"Timeout while fetching HLS manifest: {e}",
-                ) from e
-            except aiohttp.ClientError as e:
-                raise HTTPException(status_code=502, detail=f"Network error fetching HLS manifest: {e}") from e
-
-        streams = parse_hls_playlist(playlist_content, base_url=hls_params.destination)
-        if not streams:
-            raise HTTPException(status_code=404, detail="No streams found in the manifest.")
-
-        # Select stream based on resolution parameter or max_res
-        if hls_params.resolution:
-            selected_stream = find_stream_by_resolution(streams, hls_params.resolution)
-            if not selected_stream:
-                raise HTTPException(
-                    status_code=404, detail=f"No suitable stream found for resolution {hls_params.resolution}."
-                )
-        else:
-            # max_res: select highest resolution
-            selected_stream = max(
-                streams,
-                key=lambda s: s.get("resolution", (0, 0))[0] * s.get("resolution", (0, 0))[1],
-            )
-
-        if selected_stream.get("resolution", (0, 0)) == (0, 0):
-            logger.warning(
-                "Selected stream has resolution (0, 0); resolution parsing may have failed or not be available in the manifest."
-            )
-
-        # Rebuild the manifest preserving master-level directives
-        # but removing non-selected variant blocks
-        lines = playlist_content.splitlines()
-        selected_variant_index = streams.index(selected_stream)
-
-        variant_index = -1
-        new_manifest_lines = []
-        i = 0
-        while i < len(lines):
-            line = lines[i]
-            if line.startswith("#EXT-X-STREAM-INF"):
-                variant_index += 1
-                next_line = ""
-                if i + 1 < len(lines) and not lines[i + 1].startswith("#"):
-                    next_line = lines[i + 1]
-
-                # Only keep the selected variant
-                if variant_index == selected_variant_index:
-                    new_manifest_lines.append(line)
-                    if next_line:
-                        new_manifest_lines.append(next_line)
-
-                # Skip variant block (stream-inf + optional url)
-                i += 2 if next_line else 1
-                continue
-
-            # Preserve all other lines (master directives, media tags, etc.)
-            new_manifest_lines.append(line)
-            i += 1
-
-        new_manifest = "\n".join(new_manifest_lines)
-
-        # Parse skip segments (already returns list of dicts with 'start' and 'end' keys)
-        skip_segments_list = hls_params.get_skip_segments()
-
-        # Process the new manifest to proxy all URLs within it
-        processor = M3U8Processor(
-            request,
-            hls_params.key_url,
-            hls_params.force_playlist_proxy,
-            hls_params.key_only_proxy,
-            hls_params.no_proxy,
-            skip_segments_list,
-            hls_params.start_offset,
-        )
-        processed_manifest = await processor.process_m3u8(new_manifest, base_url=hls_params.destination)
-
-        return Response(content=processed_manifest, media_type="application/vnd.apple.mpegurl")
 
     return await handle_hls_stream_proxy(request, hls_params, proxy_headers, hls_params.transformer)
 
@@ -476,10 +314,14 @@ async def hls_segment_proxy(
             response_headers = apply_header_manipulation(base_headers, proxy_headers)
             return Response(content=segment_data, media_type=mime_type, headers=response_headers)
 
-        # get_or_download returned None (timeout or error) - fall through to streaming
-        logger.warning(f"[hls_segment_proxy] Prebuffer timeout, using direct streaming: {segment_url}")
+        # get_or_download returned None (timeout or error) - fall through to direct fetch
+        logger.warning(f"[hls_segment_proxy] Prebuffer timeout, using direct fetch: {segment_url}")
 
-    # Fallback to direct streaming
+    # Fallback to direct streaming.
+    # Override the response Content-Type so that CDN-served MPEG-TS segments
+    # are not interpreted as a non-video format.
+    if mime_type != "application/octet-stream":
+        proxy_headers.response["content-type"] = mime_type
     return await handle_stream_request("GET", segment_url, proxy_headers, transformer)
 
 
@@ -615,6 +457,203 @@ def _build_hls_query_params(request: Request, destination: str) -> str:
     return "&".join(params)
 
 
+MEDIAFLOW_IP_PLACEHOLDER = "{mediaflow_ip}"
+_IP_DETECT_URLS = ["https://api.ipify.org", "https://checkip.amazonaws.com"]
+_cached_public_ip: str | None = None
+_public_ip_lock: asyncio.Lock | None = None
+
+
+async def _resolve_public_ip() -> str | None:
+    """Return MediaFlow's public IP: configured value, cached detection, or None."""
+    global _cached_public_ip, _public_ip_lock
+
+    if settings.public_ip:
+        return settings.public_ip
+    if _cached_public_ip:
+        return _cached_public_ip
+
+    if _public_ip_lock is None:
+        _public_ip_lock = asyncio.Lock()
+
+    async with _public_ip_lock:
+        if _cached_public_ip:
+            return _cached_public_ip
+        for url in _IP_DETECT_URLS:
+            try:
+                async with aiohttp.ClientSession() as sess:
+                    async with sess.get(url, timeout=ClientTimeout(total=5)) as resp:
+                        ip = (await resp.text()).strip()
+                        if ip:
+                            _cached_public_ip = ip
+                            return ip
+            except Exception:
+                continue
+    return None
+
+
+_IP_DISCLOSURE_HEADERS = frozenset(
+    {
+        "x-forwarded-for",
+        "x-real-ip",
+        "x-client-ip",
+        "true-client-ip",
+        "forwarded",
+        "cf-connecting-ip",
+        "x-original-forwarded-for",
+        "x-cluster-client-ip",
+    }
+)
+
+_HOP_BY_HOP_HEADERS = frozenset(
+    {
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailers",
+        "transfer-encoding",
+        "upgrade",
+    }
+)
+
+# Headers that callers must not inject via h_* params — they enable host-header
+# injection, HTTP request smuggling, or break the session's own framing logic.
+_BLOCKED_REQUEST_HEADERS = frozenset(
+    {
+        "host",
+        "content-length",
+        "transfer-encoding",
+        "content-encoding",
+    }
+)
+
+
+def _check_forward_destination(destination: str) -> None:
+    """SSRF guard and allowlist/denylist check for /proxy/forward."""
+    parsed = urlparse(destination)
+
+    # Only allow http(s) — blocks file://, ftp://, gopher://, data:, javascript:, etc.
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in ("http", "https"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid URL scheme '{scheme}'. Only http and https are allowed.",
+        )
+
+    hostname = (parsed.hostname or "").lower()
+
+    if not hostname:
+        raise HTTPException(status_code=400, detail="Invalid destination URL: no hostname")
+
+    # Allowlist check (if configured)
+    allowed = settings.forward_allowed_hosts
+    if allowed and hostname not in {h.lower() for h in allowed}:
+        raise HTTPException(status_code=403, detail=f"Host '{hostname}' is not in forward_allowed_hosts")
+
+    # Explicit denylist
+    denied = {h.lower() for h in settings.forward_denied_hosts}
+    if hostname in denied:
+        raise HTTPException(status_code=403, detail=f"Host '{hostname}' is denied")
+
+    # Always block loopback literals
+    if hostname in ("localhost", "ip6-localhost", "ip6-loopback"):
+        raise HTTPException(status_code=403, detail="Forwarding to localhost is not allowed")
+
+    # Block private/loopback/link-local IPs given as literals
+    try:
+        addr = ipaddress.ip_address(hostname)
+        if addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_unspecified:
+            raise HTTPException(status_code=403, detail="Forwarding to private/loopback addresses is not allowed")
+    except ValueError:
+        pass  # Not a numeric IP — hostname-based SSRF is the caller's responsibility
+
+
+@proxy_router.api_route(
+    "/forward",
+    methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+)
+async def proxy_forward_endpoint(
+    request: Request,
+    proxy_headers: Annotated[ProxyRequestHeaders, Depends(get_proxy_headers)],
+    destination: str = Query(..., description="The destination URL to forward to.", alias="d"),
+):
+    """
+    Generic transparent HTTP forwarding endpoint.
+
+    Forwards any HTTP method (including POST with body) to the given destination URL
+    using MediaFlow's outbound IP. Useful for IP-bound API calls (e.g. debrid service
+    APIs, extractor POST requests) where the request must appear to originate from
+    MediaFlow rather than the addon server.
+
+    Pass outbound headers via ``h_<name>=<value>`` query params. The upstream response
+    (status code, headers, body) is returned verbatim. IP-disclosure headers are
+    stripped before forwarding so the caller's IP is not leaked.
+    """
+    destination = sanitize_url(destination)
+    _check_forward_destination(destination)
+
+    # Strip IP-disclosure headers — the whole point is hiding the origin IP
+    for h in _IP_DISCLOSURE_HEADERS:
+        proxy_headers.request.pop(h, None)
+
+    # Strip headers that could enable host-header injection or HTTP smuggling
+    for h in _BLOCKED_REQUEST_HEADERS:
+        proxy_headers.request.pop(h, None)
+
+    body = await request.body()
+    if len(body) > settings.forward_max_request_body_bytes:
+        raise HTTPException(status_code=413, detail="Request body too large")
+    max_response_bytes = settings.forward_max_response_body_bytes
+
+    # Substitute {mediaflow_ip} placeholder with MediaFlow's actual public IP so
+    # debrid services receive a consistent ip= parameter that matches the TCP source.
+    if MEDIAFLOW_IP_PLACEHOLDER in destination or MEDIAFLOW_IP_PLACEHOLDER.encode() in body:
+        public_ip = await _resolve_public_ip()
+        if public_ip:
+            destination = destination.replace(MEDIAFLOW_IP_PLACEHOLDER, public_ip)
+            body = body.replace(MEDIAFLOW_IP_PLACEHOLDER.encode(), public_ip.encode())
+
+    async with create_aiohttp_session(destination) as (session, proxy_url):
+        try:
+            async with session.request(
+                method=request.method,
+                url=destination,
+                headers=proxy_headers.request,
+                data=body if body else None,
+                proxy=proxy_url,
+                timeout=ClientTimeout(total=settings.transport_config.timeout),
+                allow_redirects=True,
+            ) as upstream_resp:
+                resp_body = await upstream_resp.content.read(max_response_bytes + 1)
+                if len(resp_body) > max_response_bytes:
+                    raise HTTPException(status_code=502, detail="Upstream response too large")
+
+                resp_headers = {k: v for k, v in upstream_resp.headers.items() if k.lower() not in _HOP_BY_HOP_HEADERS}
+                resp_headers.update(proxy_headers.response)
+
+                return Response(
+                    content=resp_body,
+                    status_code=upstream_resp.status,
+                    headers=resp_headers,
+                )
+        except aiohttp.ClientResponseError as e:
+            raise HTTPException(status_code=e.status, detail=f"Upstream error: {e.message}")
+        except asyncio.TimeoutError:
+            raise HTTPException(status_code=504, detail="Upstream timeout")
+        except aiohttp.ClientError as e:
+            raise HTTPException(status_code=502, detail=f"Upstream connection error: {e}")
+
+
+@proxy_router.get("/ip")
+async def get_public_ip_endpoint():
+    """Return MediaFlow's public IP address."""
+    ip = await _resolve_public_ip()
+    if ip is None:
+        raise HTTPException(status_code=503, detail="Could not determine public IP")
+    return {"ip": ip}
+
+
 @proxy_router.head("/stream")
 @proxy_router.get("/stream")
 @proxy_router.head("/stream/{filename:path}")
@@ -676,35 +715,6 @@ async def proxy_stream_endpoint(
     # Sanitize destination URL to fix common encoding issues
     destination = sanitize_url(destination)
 
-    # Check if this is a DLHD key URL request with key params in query
-    dlhd_salt = request.query_params.get("dlhd_salt")
-    dlhd_token = request.query_params.get("dlhd_token")
-    if dlhd_salt and "/key/" in destination:
-        # This is a DLHD key URL - compute dynamic headers via executor to avoid blocking
-        from mediaflow_proxy.extractors.dlhd import compute_key_headers
-
-        key_headers = await asyncio.to_thread(compute_key_headers, destination, dlhd_salt)
-        if key_headers:
-            ts, nonce, key_path, fingerprint = key_headers
-            proxy_headers.request.update(
-                {
-                    "X-Key-Timestamp": str(ts),
-                    "X-Key-Nonce": str(nonce),
-                    "X-Fingerprint": fingerprint,
-                    "X-Key-Path": key_path,
-                }
-            )
-            if dlhd_token:
-                proxy_headers.request["Authorization"] = f"Bearer {dlhd_token}"
-            logger.info(f"[proxy_stream] Computed DLHD key headers for: {destination}")
-
-    # Check if destination contains DLHD pattern and extract stream directly
-    dlhd_result = await check_and_extract_dlhd_stream(request, destination, proxy_headers)
-    if dlhd_result:
-        # Update destination and headers with extracted stream data
-        destination = dlhd_result["destination_url"]
-        proxy_headers.request.update(dlhd_result.get("request_headers", {}))
-
     # Handle transcode mode — transcode uses time-based seeking, not byte ranges
     if transcode:
         if not settings.enable_transcode:
@@ -725,6 +735,9 @@ async def proxy_stream_endpoint(
 
     if "range" not in proxy_headers.request:
         proxy_headers.request["range"] = "bytes=0-"
+        # Mark that this range was auto-added (not from client)
+        # This is used in handlers.py to decide whether to convert 206->200
+        proxy_headers.auto_added_range = True
 
     if filename:
         # If a filename is provided (not a segment), set it in the headers using RFC 6266 format
